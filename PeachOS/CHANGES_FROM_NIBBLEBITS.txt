@@ -1,0 +1,390 @@
+notes on what I changed vs upstream PeachOS
+===========================================
+
+upstream:  https://github.com/nibblebits/PeachOS
+baseline:  master branch, snapshot taken at the start of the project
+
+I'm not listing every whitespace tweak or build artifact here. Just the
+real changes that matter for getting the todo app running on top of
+PeachOS. If something isn't in this list, assume it's untouched.
+
+The ordering below roughly follows "outside-in" - build glue first,
+then the user program, then the kernel-side stuff, then disk and boot.
+
+
+--------------------------------------------------------------------
+1) Makefile  (top-level)
+
+This is where the new pieces actually get pulled into the build.
+
+  - There's a new compile rule for src/isr80h/src_todo.c. That object
+    file (src_todo.o) is also added to the kernel link list, otherwise
+    the new syscall handlers would never end up inside kernel.bin and
+    the linker would just throw "undefined reference" at us.
+  - programs/todo is added to both user_programs and the matching
+    clean target, so it builds and cleans alongside shell/blank/stdlib.
+  - During image assembly there's now an mcopy step that drops
+    todo.elf into the FAT region of os.bin. Without that, the shell
+    would happily try to run "todo" and then fail with file-not-found,
+    because nothing put the binary into the disk image.
+  - The general user-file copy path was switched over to mcopy. The
+    previous flow worked on the original author's host but was kind of
+    fragile with newer mtools versions on our machines.
+
+Why we did it this way: we wanted the *minimum* surgery that makes
+"build and run" still be one ./build.sh call. No new scripts, no
+manual copy steps - if you forget any of these, the symptom is super
+obvious (link error, or shell saying it can't find todo).
+
+
+--------------------------------------------------------------------
+2) programs/stdlib/src/peachos.h
+
+Added the user-facing C declarations for the new syscalls:
+
+    int  peachos_todo_add(const char* desc);
+    int  peachos_todo_list(void);
+    int  peachos_todo_remove(int id);
+    int  peachos_todo_save(const char* name, const char* key);
+    int  peachos_todo_load(const char* name, const char* key);
+
+Putting these in the stdlib header (rather than in the todo program
+directly) means the todo app uses them like any other library
+function. We get type checking, autocompletion, and - more importantly
+- the assembly trampoline is hidden so todo.c reads like normal C.
+
+We chose this layout to mirror how upstream already exposes things
+like peachos_terminal_readline and peachos_exit. Following the
+existing convention made the diff small and easy to review.
+
+
+--------------------------------------------------------------------
+3) programs/stdlib/src/peachos.asm
+
+This is the bridge from user mode into the kernel. Each declaration
+above gets a tiny assembly wrapper that:
+
+  - puts the syscall number into EAX
+  - leaves the C-ABI arguments on the stack where the kernel
+    dispatcher already knows how to find them
+  - executes  int 0x80
+  - cleans up and returns the value the kernel handed back
+
+Number assignments we're using:
+
+    EAX = 10   add
+    EAX = 11   list
+    EAX = 12   remove
+    EAX = 13   save
+    EAX = 14   load
+
+These have to match the enum in src/isr80h/isr80h.h *exactly*. If
+they ever drift apart, calls silently route to the wrong handler and
+you get genuinely confusing bugs (e.g. an "add" actually triggering
+"remove"). We picked 10..14 because 0..9 were already taken by
+upstream and we wanted a small contiguous block that's obvious in a
+hex dump.
+
+
+--------------------------------------------------------------------
+4) programs/todo  (entirely new directory)
+
+This is the user-space program itself. Five files, deliberately small:
+
+  Makefile     Builds todo.elf out of main.c and todo.c, links against
+               the existing stdlib.elf. Mirrors programs/shell/Makefile
+               on purpose so that it's instantly familiar to anyone
+               who has read the shell build.
+
+  linker.ld    Standard PeachOS user-program layout: ENTRY(_start),
+               OUTPUT_FORMAT(elf32-i386), base address 0x400000. We
+               didn't invent any of this - 0x400000 is where the
+               PeachOS loader maps user processes, so the linker
+               script just has to agree with that.
+
+  main.c       Intentionally one line of real code: return todo_run();
+               We separated entry point from logic so that anyone
+               reading the program can immediately tell where to look
+               next, and so we never confuse "process startup" with
+               "command handling".
+
+  todo.h       Just declares todo_run(). It exists so main.c doesn't
+               need to include the full implementation.
+
+  todo.c       The REPL. Walkthrough:
+                 - Print a small banner and "type help" hint.
+                 - Loop forever:
+                     * print prompt
+                     * read one line via peachos_terminal_readline
+                     * dispatch on the first word
+                 - Commands implemented at the user level:
+                     add <task>     -> peachos_todo_add
+                     list           -> peachos_todo_list
+                     remove <id>    -> peachos_todo_remove
+                     help           -> local print
+                     exit           -> peachos_exit, returns to shell
+                 - Anything else prints "Unknown command".
+
+               Design choices we'll defend in class:
+                 * One command per line, parsed as plain text. No
+                   tokenizer, no quoting, no escapes - keeps the code
+                   under 200 lines and easy to step through with GDB.
+                 * Validation lives in the user program (e.g. parsing
+                   the integer for `remove`). The kernel still
+                   double-checks, but failing fast in user space gives
+                   a nicer error message.
+                 * All user-facing strings are #defines at the top of
+                   the file. If a TA wants to change wording, they
+                   only edit one block.
+
+
+--------------------------------------------------------------------
+5) src/isr80h/isr80h.h
+
+Added enum values 10..14 for the todo syscalls. This is the contract
+side of what's in peachos.asm. We deliberately put the new entries at
+the end of the existing enum so we wouldn't shift any of the upstream
+syscall numbers (which would have broken every other user program).
+
+
+--------------------------------------------------------------------
+6) src/isr80h/isr80h.c
+
+Two changes:
+  - #include "src_todo.h"
+  - In isr80h_register_commands(), register the five handlers:
+
+       cmd 10  ->  isr80h_command10_todo_add
+       cmd 11  ->  isr80h_command11_todo_list
+       cmd 12  ->  isr80h_command12_todo_remove
+       cmd 13  ->  isr80h_command13_todo_save
+       cmd 14  ->  isr80h_command14_todo_load
+
+This is the moment where a syscall number actually becomes a function
+pointer the dispatcher can call.
+
+
+--------------------------------------------------------------------
+7) src/isr80h/src_todo.h  (new)
+
+Just the prototypes for the five handlers above. It exists so isr80h.c
+and src_todo.c can share consistent signatures without one of them
+guessing. Single source of truth for the syscall function shapes.
+
+
+--------------------------------------------------------------------
+8) src/isr80h/src_todo.c  (new - this is the meaty one)
+
+This is the kernel-side implementation. Worth a longer look since it's
+where most of the project's actual code lives.
+
+  Constants we picked, and why:
+    TODO_MAX_TASKS    = 64
+        Enough headroom for a demo, small enough that the static
+        kernel array doesn't bloat the kernel image.
+    TODO_DESC_MAX     = 64
+        One short line of text per task. We checked: this fits inside
+        the terminal width with the [id] prefix and a newline.
+    TODO_SAVE_SLOTS   = 8
+        Eight named save files. Bigger than we need for a demo,
+        smaller than what would force us to grow the catalog past one
+        sector.
+    TODO_SLOT_SECTORS = 10
+        10 sectors = 5 KB per saved file, plenty for 64 tasks worth
+        of serialized data.
+    TODO_CATALOG_LBA  = 32000
+        Picked a sector that's well past anything the FAT image
+        actually uses. Way safer than the alternative of trying to
+        reuse free space inside the filesystem, which would risk
+        clobbering user files.
+    TODO_DATA_BASE_LBA = TODO_CATALOG_LBA + 1
+        Payload sectors start right after the catalog so we keep
+        everything in one contiguous region.
+
+  In-memory model:
+    static struct todo_task todo_tasks[TODO_MAX_TASKS];
+    static int todo_next_id = 1;
+
+    Each slot stores: id, an "active" flag, a "complete" flag, and a
+    description buffer. We use an active flag instead of moving array
+    elements around when something is removed, because:
+      - it makes ids stable (slot index != id)
+      - removal is O(1)
+      - listing just skips inactive entries
+
+    todo_next_id is monotonic. We do *not* recycle IDs even after a
+    remove, because if you happened to type the wrong number twice
+    you could accidentally hit a brand-new task. Monotonic IDs make
+    the user's mental model match the program's actual behavior.
+
+  Add (cmd 10):
+    Reads the user pointer off the task stack, then uses
+    copy_string_from_task to safely pull the description into a
+    kernel buffer. We never dereference the raw user pointer
+    directly - that's the whole point of having that helper, since a
+    bad user pointer should be a syscall failure, not a kernel
+    crash. After copying, we reject empty strings, find the first
+    inactive slot, fill it in, and return the new id back to user
+    space.
+
+  List (cmd 11):
+    Counts active tasks first. If zero, prints "No tasks available"
+    so the user gets feedback instead of silence. Otherwise prints
+    "[id] description" lines. We print directly from kernel for two
+    reasons: the data already lives in kernel memory, and avoiding a
+    copy back to userspace keeps this path simple.
+
+  Remove (cmd 12):
+    Reads the id from the task stack, scans for an active match, and
+    memsets the entire struct to zero. Memset (instead of just
+    flipping `active = 0`) means stale description bytes can't leak
+    out of a recycled slot if something goes wrong elsewhere.
+
+  Save / load format (cmds 13 and 14):
+    The on-disk layout is two regions:
+
+      Catalog sector at TODO_CATALOG_LBA:
+        magic = "TDOCAT1"
+        version = 1
+        used[8], lengths[8], names[8]
+      Per-slot payload starting at TODO_DATA_BASE_LBA:
+        magic = "TDODAT1"
+        next_id, task_count
+        followed by task_count packed entries
+
+    Why magic strings? They cost us 7 bytes and they immediately
+    catch the case where we point at the wrong sector during dev. The
+    load path refuses to interpret anything without the right magic,
+    which prevented at least two embarrassing crashes during testing
+    when a typo had us reading a random LBA.
+
+    Why XOR "encryption"? It is *not* real cryptography, and we are
+    careful to not call it that in the demo. Two real reasons we
+    included it:
+      1. It demonstrates that user-supplied data (the key) gets
+         routed all the way down through the syscall layer and used
+         by the kernel - it's a nice end-to-end thread to walk
+         through during the presentation.
+      2. A hex dump of the disk image won't immediately leak the
+         task text, and a corrupted/truncated read fails the magic
+         check loudly instead of returning garbage.
+
+    Save flow:
+      build serialized buffer (header + entries)
+      XOR with the user-provided key
+      load catalog, find/allocate the named slot
+      write payload sectors via disk_write_block
+      update catalog metadata, write catalog back
+
+    Load flow:
+      load catalog
+      look up slot by name
+      read payload sectors
+      XOR with the same key
+      validate "TDODAT1" magic
+      rebuild todo_tasks array, restore todo_next_id
+
+  Error handling:
+    All handlers return negative status codes (-EINVARG, -ENOMEM,
+    -EIO) wrapped with the ERROR(...) macro the syscall ABI expects.
+    User space sees a negative return value and prints a friendly
+    message - no special error channel needed.
+
+
+--------------------------------------------------------------------
+9) src/disk/disk.h  and  src/disk/disk.c
+
+Upstream PeachOS only had reads, which obviously won't cut it the
+moment you want save to actually persist anything. We added:
+
+    int disk_write_sector(int lba, const char* buf);
+    int disk_write_block(struct disk* idisk, unsigned int lba,
+                         int total, const char* buf);
+
+disk_write_sector is the single-sector ATA write path. disk_write_block
+is the convenience wrapper that loops over multiple sectors so callers
+don't need to remember the 512-byte sector size.
+
+We also tightened the ATA "ready" polling. The original busy-wait
+could hang silently if the device flagged an error or stayed busy.
+Now polling has an iteration cap and bails with -EIO instead of
+spinning forever. This made debugging the save path *significantly*
+less painful - early on we had at least one bug where qemu's IDE was
+reporting BSY and the kernel just froze with no clue why.
+
+Defending the design choice: writes are deliberately the same shape
+as reads (mirror function names, mirror argument order). It would have
+been faster to write a different API just for our needs, but matching
+the existing convention means anyone familiar with disk_read_block
+can read disk_write_block at a glance.
+
+
+--------------------------------------------------------------------
+10) src/kernel.c
+
+Two real changes:
+
+  - Initial user process is now shell.elf instead of the upstream
+    blank.elf demo. Without this you boot into nothing useful and
+    can't reach the todo app at all.
+  - Removed the old blank.elf argv-injection demo path. It was doing
+    something quite specific to demonstrate process argument passing,
+    and it would race with normal shell startup.
+  - Small terminal scroll behavior tweak so the screen scrolls up
+    instead of just stopping at the bottom row. With todo this matters
+    fast - even 20 tasks pushes the welcome banner off screen.
+
+
+--------------------------------------------------------------------
+runtime relationship map  (how it all hangs together)
+
+  boot
+    -> kernel sets up GDT/IDT/paging/heap
+    -> kernel hands control to shell.elf as the first user process
+
+  user types "todo"
+    -> shell looks up todo.elf in the FAT image
+    -> shell creates a new user process and jumps in
+
+  inside todo.elf
+    -> main() calls todo_run()
+    -> REPL loop reads a line, dispatches by first word
+    -> commands call peachos_todo_* in stdlib
+
+  user -> kernel
+    -> wrapper in peachos.asm sets EAX = syscall number
+    -> int 0x80 traps into the kernel
+
+  kernel side
+    -> isr80h dispatcher looks up EAX in the command table
+    -> calls the matching handler in src_todo.c
+    -> handler reads/modifies kernel state (and disk for save/load)
+
+  return path
+    -> handler returns a value (or ERROR(-x))
+    -> control flows back through the syscall path into user mode
+    -> user code prints success/failure and loops
+
+  exit
+    -> peachos_exit tears down the process
+    -> shell prompt comes back
+
+
+--------------------------------------------------------------------
+quick demo script  (the order we usually walk through it in class)
+
+    boot in qemu
+    shell> todo
+    > help
+    > add buy milk
+    > add finish report
+    > list
+    > remove 1
+    > list
+    > exit
+    shell>
+
+That covers the whole user-visible surface. The save/load path can be
+demoed by calling peachos_todo_save / peachos_todo_load directly from
+a test build - we left that out of the REPL on purpose to keep the
+in-class demo focused on the syscall + REPL story.

@@ -1,0 +1,15 @@
+# Build artifacts
+build/**/*.o
+build/**/.keep
+bin/os.bin
+bin/kernel.bin
+bin/boot.bin
+
+# Program ELFs and object files
+programs/**/*.elf
+programs/**/*.o
+programs/**/build/*.o
+
+# macOS metadata
+.DS_Store
+._*
