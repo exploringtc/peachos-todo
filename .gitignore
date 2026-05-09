@@ -1,0 +1,8 @@
+# top-level build artifacts (object files, linked elf, etc.)
+/build/
+*.o
+*.elf
+
+# OS junk
+.DS_Store
+._*
